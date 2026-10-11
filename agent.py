@@ -134,12 +134,41 @@ def resolve_sources(question, docs):
             found = notes
     return found
  
+DOC_WORD = re.compile(r"lecture|pdf|document|file|slides?|محاضر|ملف|مستند|شرائح", re.I)
+TIME_WORD = re.compile(r"today|yesterday|last |this (week|month|year)|\bago\b|since|before|after|week|month|year|"
+                       r"اليوم|أمس|امس|الأسبوع|الشهر|السنة|الماضي|الماضية|منذ|قبل|بعد", re.I)
+ 
+def wants_bridge(question, named):
+    """'Difference between sampling and quantization' is a concept question, not a request to relate
+    two documents. Bridge retrieval only when the question points at two or more documents."""
+    return len(named) >= 2 or bool(NOTE_WORD.search(question) and (DOC_WORD.search(question) or named))
+ 
+STOPWORDS = set("relate between about notes lecture study studied learn learned learnt uploaded upload document documents explain "
+                "summarize summary difference should would could which please remember arabic english answer question what does "
+                "have there their these those think thing things".split())
+ 
+def top_score(hits):
+    return max([h.get("score", 1.0) for h in hits], default=0.0)
+ 
+def no_real_match(question, hits):
+    """True when retrieval clearly found nothing about the question's topic.
+    e.g. 'quantum computing' only pulls 'quantization' slides at score ~0.34 with no shared topic word."""
+    if not hits:
+        return True
+    top = top_score(hits)
+    words = [w for w in re.findall(r"[a-z]{6,}", question.lower()) if w not in STOPWORDS]
+    if words:                                        # Latin query: need a topic word (6-letter stem) in some chunk
+        text = " ".join(h["text"].lower() for h in hits)
+        return top < 0.36 and not any(w[:6] in text for w in words)
+    return top < 0.25                                # Arabic/other: cross-language scores are lower, so be lenient
+ 
 def gather_context(kb, question):
     """Automatic retrieval. For cross-document questions, use the smallest document's chunks as queries
     against the other documents ("bridge" retrieval) so related passages from EVERY source are found."""
     docs = kb.documents()
     names = [d["source"] for d in docs]
-    if RELATE.search(question) and 2 <= len(names) <= 4:
+    named = resolve_sources(question, docs)
+    if RELATE.search(question) and 2 <= len(names) <= 4 and wants_bridge(question, named):
         seed = min(docs, key=lambda d: d["chunks"])["source"]
         seed_hits = kb.search(question, 2, source=seed)
         hits = list(seed_hits)
@@ -155,7 +184,6 @@ def gather_context(kb, question):
             key = (h["source"], h["text"][:80])
             if key not in seen: seen.add(key); uniq.append(h)
         return _clip(uniq), "bridge_search", docs
-    named = resolve_sources(question, docs)
     if named:                                        # question names a document: search only inside it
         per = 3 if len(named) == 1 else 2
         hits = []
@@ -163,7 +191,10 @@ def gather_context(kb, question):
             hits += kb.search(question, per, source=n)
         if hits:
             return _clip(hits), "source_search", docs
-    return _clip(kb.search(question, 3)), "auto_search", docs
+    hits = _clip(kb.search(question, 3))
+    if no_real_match(question, hits):                # weak scores AND the topic words appear nowhere: don't let the model improvise
+        return [], "no_match", docs
+    return hits, "auto_search", docs
  
 PREF_OPEN = re.compile(r"^\s*(i prefer|i like|i want|i'd like|always|from now on|remember|أفضل|افضل|أحب|احب|أريد|اريد|دائما|دائماً|من الآن|تذكر)", re.I)
 PREF_STYLE = re.compile(r"answer|repl|respon|summar|bullet|short|brief|detail|concise|format|language|arabic|english|إجاب|اجاب|رد|مختصر|نقاط|مفصل|عرب|انجليز|إنجليز|لغة", re.I)
@@ -249,7 +280,18 @@ def run_agent(llm, user_msg, kb, mem, max_steps=5):
     task = ("\n\n[Task] Retrieval is complete. Do NOT call tools. Using ONLY the chunks above, explain how the documents relate: "
             "(1) what each source says about the shared topic, taking each source's content only from chunks whose source field names it; "
             "(2) how they connect or differ; (3) what is not shown in the retrieved passages. Say 'not shown in the retrieved passages'; never claim that a document does not cover a topic, because you only see a few passages. Do not call the documents' wording different unless the passages show it. Reply with FINAL:."
-            if mode == "bridge_search" else "")
+            if mode == "bridge_search" else
+            "\n\n[Task] Retrieval is complete. Do NOT call tools. The chunks above come only from the document(s) the user named. "
+            "Answer using ONLY these chunks. If they do not contain the answer, say that the named document does not mention it "
+            "in the retrieved passages; do not answer from other documents. Reply with FINAL:."
+            if mode == "source_search" else
+            "\n\n[Task] The search found NOTHING in the user's documents about this topic. Do NOT call tools and do NOT answer from your own knowledge. "
+            "Reply with FINAL: say plainly that none of the documents cover it, then list what the documents do cover using [Your documents]. "
+            "Do not link the topic to anything in the documents."
+            if mode == "no_match" else
+            ("\n\n[Note] The match scores are low. Use a chunk only if it directly answers the question; otherwise say the notes do not cover it. "
+             "Cite only the source named in the chunk you actually use, and never attribute a chunk to another document."
+             if hits and top_score(hits) < 0.45 else ""))
     first = (f"{user_msg}\n\n[Your documents]\n{doc_list}\n\n"
              f"[Notes retrieved automatically; each chunk shows its own source]\n{ctx[:4500]}{task}{tag}")
     msgs = mem.recent() + [{"role": "user", "content": first}]
@@ -267,9 +309,11 @@ def run_agent(llm, user_msg, kb, mem, max_steps=5):
             mem.add_turn("user", user_msg); mem.add_turn("assistant", val)
             return val, trace
         name, args = val
+        if args and not TIME_WORD.search(user_msg):      # the model invents since/until; keep them only for time questions
+            args = {k: v for k, v in args.items() if k not in ("since", "until")}
         if args is None:
             obs = "Observation: ARGS was not valid JSON. Retry with one-line valid JSON."
-        elif (mode == "bridge_search" and name in ("search_notes", "list_documents")) \
+        elif (mode in ("bridge_search", "source_search", "no_match") and name in ("search_notes", "list_documents")) \
                 or (name, json.dumps(args, sort_keys=True, ensure_ascii=False)) in done:
             obs = "Observation: Retrieval is already complete. Do not search again. Reply now with FINAL using only the notes retrieved above."
         else:
