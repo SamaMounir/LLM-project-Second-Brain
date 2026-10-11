@@ -2,14 +2,17 @@ import os
 import streamlit as st
 from kb import KnowledgeBase
 from agent import Memory, LLMClient, run_agent
-
+ 
 st.set_page_config(page_title="Second Brain", page_icon="🧠", layout="wide")
-
+st.markdown("""<style>
+.stMarkdown p, .stMarkdown li, [data-testid="stChatMessage"] p {unicode-bidi: plaintext; text-align: start;}
+</style>""", unsafe_allow_html=True)  # Arabic text aligns right automatically
+ 
 @st.cache_resource
 def get_kb(): return KnowledgeBase()
 kb = get_kb()
 mem = Memory()
-
+ 
 # ---------------- Sidebar: ingestion ----------------
 with st.sidebar:
     st.title("🧠 Second Brain")
@@ -32,9 +35,9 @@ with st.sidebar:
         if st.button("Fetch & index") and url:
             try: st.success(f"{kb.add(url, kb.fetch_url(url), kind='bookmark')} chunks")
             except Exception as e: st.error(e)
-
+ 
 tab_chat, tab_lib, tab_tasks, tab_mem = st.tabs(["💬 Chat", "📚 Library", "✅ Tasks", "🧩 Memory"])
-
+ 
 # ---------------- Chat ----------------
 with tab_chat:
     for m in mem.d["history"]:
@@ -51,12 +54,12 @@ with tab_chat:
                 with st.expander(f"🔍 Agent steps ({len(trace)} tool calls)"):
                     for t in trace:
                         st.code(f"{t['tool']}({t['input']})", language="python")
-                        if t["tool"] == "search_notes" and isinstance(t["output"], list):
+                        if t["tool"] in ("search_notes", "auto_search", "bridge_search", "sample_passages") and isinstance(t["output"], list):
                             for h in t["output"]:
                                 st.caption(f"**{h['source']}** · {h['date']} · score {h['score']}")
                                 st.write(h["text"][:300] + "…")
     if st.button("Clear conversation"): mem.clear_history(); st.rerun()
-
+ 
 # ---------------- Library ----------------
 with tab_lib:
     docs = kb.documents()
@@ -65,14 +68,14 @@ with tab_lib:
         c1, c2 = st.columns([6, 1])
         c1.write(f"**{d['source']}** · {d['kind']} · {d['date']} · {d['chunks']} chunks")
         if c2.button("🗑", key="del" + d["source"]): kb.delete(d["source"]); st.rerun()
-
+ 
 # ---------------- Tasks ----------------
 with tab_tasks:
     if not mem.d["tasks"]: st.info("Ask: 'Turn my CNN notes into a study plan'.")
     for i, t in enumerate(mem.d["tasks"]):
         done = st.checkbox(f"{t['title']}  _{t.get('source','')} {t.get('due','')}_", t["done"], key=f"t{i}")
         if done != t["done"]: mem.d["tasks"][i]["done"] = done; mem.save()
-
+ 
 # ---------------- Memory ----------------
 with tab_mem:
     st.subheader("Preferences"); st.json(mem.d["preferences"])
